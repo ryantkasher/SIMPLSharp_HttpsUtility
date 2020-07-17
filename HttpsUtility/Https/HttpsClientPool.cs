@@ -24,63 +24,70 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
-using Crestron.SimplSharp.Net.Http;
 using Crestron.SimplSharp.Net.Https;
 using HttpsUtility.Diagnostics;
-using HttpsUtility.Threading;
 
+using ContentSource = Crestron.SimplSharp.Net.Https.ContentSource;
 using RequestType = Crestron.SimplSharp.Net.Https.RequestType;
-
-// ReSharper disable UnusedMember.Global
 
 namespace HttpsUtility.Https
 {
-    public sealed class HttpsClient : IDisposable
+    public sealed class HttpsClientPool : IDisposable
     {
-        private readonly SyncSection _requestLock = new SyncSection();
-        private readonly Lazy<Crestron.SimplSharp.Net.Https.HttpsClient> _httpsClient
-            = new Lazy<Crestron.SimplSharp.Net.Https.HttpsClient>(
-                    () => new Crestron.SimplSharp.Net.Https.HttpsClient { PeerVerification = false }
-                );
+        private const int HttpsClientPoolSize = 10;
 
-        private static HttpsClientRequest CreateDefaultClientRequest(string url, RequestType requestType)
-        {
-            var httpRequest = new HttpsClientRequest
-            {
-                Encoding = Encoding.UTF8,
-                RequestType = requestType,
-                Url = new UrlParser(url)
-            };
-            return httpRequest;
-        }
+        private readonly ObjectPool<Lazy<HttpsClient>> _httpsClientPool
+            = new ObjectPool<Lazy<HttpsClient>>(HttpsClientPoolSize, HttpsClientPoolSize, 
+                () => new Lazy<HttpsClient>(() => new HttpsClient {
+                    PeerVerification = false, HostVerification = false,
+                    TimeoutEnabled = true, Timeout = 5, KeepAlive = false
+                })) { CleanupPoolOnDispose = true };
 
-        private HttpsResult SendRequest(string url, RequestType requestType, IEnumerable<KeyValuePair<string, string>> additionalHeaders, string value)
+        private HttpsResult SendRequest(string url, RequestType requestType, IEnumerable<KeyValuePair<string, string>> additionalHeaders, string content)
         {
-            using (_requestLock.AquireLock())
+            var obj = _httpsClientPool.GetFromPool();
+            var client = obj.Value;
+
+            try
             {
-                HttpsClientRequest httpRequest = CreateDefaultClientRequest(url, requestType);
+                Debug.WriteInfo("Making API GET request to endpoint: {0}", url);
+                
+                if (client.ProcessBusy)
+                    client.Abort();
+
+                var httpsRequest = new HttpsClientRequest {
+                    RequestType = requestType,
+                    Encoding = Encoding.UTF8,
+                    KeepAlive = false,
+                };
+
+                if (requestType != RequestType.Get && !string.IsNullOrEmpty(content))
+                {
+                    httpsRequest.ContentSource = ContentSource.ContentString;
+                    httpsRequest.ContentString = content;
+                }
                 
                 if (additionalHeaders != null)
                 {
                     foreach (var item in additionalHeaders)
-                        httpRequest.Header.AddHeader(new HttpsHeader(item.Key, item.Value));
+                        httpsRequest.Header.AddHeader(new HttpsHeader(item.Key, item.Value));
                 }
 
-                if (!string.IsNullOrEmpty(value))
-                    httpRequest.ContentString = value;
+                httpsRequest.Url.Parse(url);
 
-                try
-                {
-                    HttpsClientResponse httpResponse = _httpsClient.Value.Dispatch(httpRequest);
-                    return new HttpsResult(httpResponse.Code, httpResponse.ResponseUrl, httpResponse.ContentString);
-                }
-                catch (HttpsException ex)
-                {
-                    Debug.LogException(GetType(), ex);
-                }
-
-                return null;
+                HttpsClientResponse httpResponse = client.Dispatch(httpsRequest);
+                return new HttpsResult(httpResponse.Code, httpResponse.ResponseUrl, httpResponse.ContentString);
             }
+            catch (Exception ex)
+            {
+                Debug.WriteException(ex);
+            }
+            finally
+            {
+                _httpsClientPool.AddToPool(obj);
+            }
+
+            return null;
         }
 
         public HttpsResult Get(string url)
@@ -130,7 +137,7 @@ namespace HttpsUtility.Https
 
         public void Dispose()
         {
-            _httpsClient.Dispose();
+            _httpsClientPool.Dispose();
         }
     }
 }

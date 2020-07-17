@@ -26,41 +26,27 @@ using System.Collections.Generic;
 using System.Linq;
 using Crestron.SimplSharp;
 using Crestron.SimplSharp.Reflection;
+using HttpsUtility.Diagnostics;
 using HttpsUtility.Https;
-using HttpsUtility.Threading;
-
-// ReSharper disable UnusedMember.Global
 
 namespace HttpsUtility.Symbols
 {
-    /* --------------------------------------------  GENERIC SIMPL+ TYPE HELPER ALIASES  -------------------------------------------- */
-    using STRING = String;             // string = STRING
-    using SSTRING = SimplSharpString;  // SimplSharpString = STRING (used to interface with SIMPL+)
-    using INTEGER = UInt16;            // ushort = INTEGER (unsigned)
-    using SIGNED_INTEGER = Int16;      // short = SIGNED_INTEGER
-    using SIGNED_LONG_INTEGER = Int32; // int = SIGNED_LONG_INTEGER
-    using LONG_INTEGER = UInt32;       // uint = LONG_INTEGER (unsigned)
-    /* ------------------------------------------------------------------------------------------------------------------------------ */
-
+    // ReSharper disable once UnusedType.Global
     public sealed partial class SimplHttpsClient
     {
-        private readonly Lazy<string> _moduleIdentifier;
-        private readonly HttpsClient _httpsClient = new HttpsClient();
-        private readonly SyncSection _httpsOperationLock = new SyncSection();
+        private readonly string _moduleIdentifier;
+        private readonly HttpsClientPool _httpsClientPool = new HttpsClientPool();
         
         public SimplHttpsClient()
         {
-            _moduleIdentifier = new Lazy<string>(() =>
-            {
-                var asm = Assembly.GetExecutingAssembly().GetName();
-                return string.Format("{0} {1}", asm.Name, asm.Version.ToString(2));
-            });
+            var asm = Assembly.GetExecutingAssembly().GetName();
+            _moduleIdentifier = string.Format("{0} {1}", asm.Name, asm.Version.ToString(2));
         }
-        
-        private static IEnumerable<KeyValuePair<string, string>> ParseHeaders(STRING input)
+
+        private static IEnumerable<KeyValuePair<string, string>> ParseHeaders(string input)
         {
             if (string.IsNullOrEmpty(input))
-                return null;
+                return new KeyValuePair<string, string>[] { };
             
             var headerTokens = input.Split('|');
             return (from header in headerTokens
@@ -72,43 +58,63 @@ namespace HttpsUtility.Symbols
                 ).ToList();
         }
 
-        private INTEGER MakeRequest(Func<HttpsResult> action)
+        private ushort MakeRequest(Func<HttpsResult> action)
         {
-            using (_httpsOperationLock.AquireLock())
+            try
             {
                 var response = action.Invoke();
-                foreach (var contentChunk in response.Content.SplitIntoChunks(250))
+                if (response == null)
                 {
-                    OnSimplHttpsClientResponse(response.Status, response.ResponseUrl, contentChunk, response.Content.Length);
-                    CrestronEnvironment.Sleep(10); // allow for things to process
+                    Debug.WriteError("HTTPS response object was null.");
+                    return 0;
                 }
-                return (INTEGER)response.Status;
+
+                // Some HTTP(S) responses will not have a message body.
+                if (response.Content == null)
+                {
+                    OnSimplHttpsClientResponse(response.Status, response.ResponseUrl, string.Empty, 0);
+                }
+                else
+                {
+                    foreach (var contentChunk in response.Content.SplitIntoChunks(255))
+                    {
+                        OnSimplHttpsClientResponse(response.Status, response.ResponseUrl, contentChunk, response.Content.Length);
+                        CrestronEnvironment.Sleep(10); // allow a little bit for things to process
+                    }
+                }
+
+                return (ushort)response.Status;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteException(ex);
+                return 0;
             }
         }
         
-        public INTEGER SendGet(STRING url, STRING headers)
+        public ushort SendGet(string url, string headers)
         {
-            return MakeRequest(() => _httpsClient.Get(url, ParseHeaders(headers)));
+            return MakeRequest(() => _httpsClientPool.Get(url, ParseHeaders(headers)));
         }
         
-        public INTEGER SendPost(STRING url, STRING headers, STRING content)
+        public ushort SendPost(string url, string headers, string content)
         {
-            return MakeRequest(() => _httpsClient.Post(url, ParseHeaders(headers), content.NullIfEmpty()));
+            return MakeRequest(() => _httpsClientPool.Post(url, ParseHeaders(headers), content.NullIfEmpty()));
         }
         
-        public INTEGER SendPut(STRING url, STRING headers, STRING content)
+        public ushort SendPut(string url, string headers, string content)
         {
-            return MakeRequest(() => _httpsClient.Put(url, ParseHeaders(headers), content.NullIfEmpty()));
+            return MakeRequest(() => _httpsClientPool.Put(url, ParseHeaders(headers), content.NullIfEmpty()));
         }
         
-        public INTEGER SendDelete(STRING url, STRING headers, STRING content)
+        public ushort SendDelete(string url, string headers, string content)
         {
-            return MakeRequest(() => _httpsClient.Delete(url, ParseHeaders(headers), content.NullIfEmpty()));
+            return MakeRequest(() => _httpsClientPool.Delete(url, ParseHeaders(headers), content.NullIfEmpty()));
         }
 
         public override string ToString()
         {
-            return _moduleIdentifier.Value;
+            return _moduleIdentifier;
         }
     }
 }
